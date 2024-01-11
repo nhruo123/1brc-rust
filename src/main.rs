@@ -30,11 +30,9 @@ fn main() {
                 let name = unsafe {
                     std::str::from_utf8_unchecked(&mmap[start_of_line_index..separator_index])
                 };
-                let report_value = unsafe {
-                    std::str::from_utf8_unchecked(&mmap[separator_index + 1..current_index])
-                        .parse::<f64>()
-                        .unwrap()
-                };
+                let report_value =
+                    parse_fixed_point_number(&mmap[separator_index + 1..current_index]) as f64
+                        / 10.0;
 
                 let entry = match reports_map.entry(name) {
                     std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
@@ -51,7 +49,8 @@ fn main() {
                 entry.report_sum += report_value;
                 entry.report_count += 1;
 
-                start_of_line_index = current_index + 1;
+                current_index += 1;
+                start_of_line_index = current_index;
             }
             b';' => {
                 separator_index = current_index;
@@ -88,4 +87,23 @@ fn main() {
     output_str.push('}');
 
     println!("{}", output_str);
+}
+
+#[inline(always)]
+pub fn parse_fixed_point_number(buffer: &[u8]) -> i64 {
+    const ASCII_OFFSET: u8 = b'0';
+    let is_negative = buffer[0] == b'-';
+    let mut number = 0;
+    let mut index = is_negative as usize;
+    while index < buffer.len() - 2 {
+        number *= 10;
+        number += (buffer[index] - ASCII_OFFSET) as i64;
+        index += 1;
+    }
+
+    number *= 10;
+    number += (buffer[buffer.len() - 1] - ASCII_OFFSET) as i64;
+
+    // this is branchless even with the if the compiler is smart 
+    number * if is_negative { -1 } else { 1 }
 }
