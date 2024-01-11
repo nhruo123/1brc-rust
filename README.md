@@ -27,3 +27,8 @@ branchless parser not sure if faster but w/e
 real    0m35.752s
 user    0m0.000s
 sys     0m0.000s
+better branchless parser
+=====
+real    0m34.433s
+user    0m0.000s
+sys     0m0.000s

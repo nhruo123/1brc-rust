@@ -3,9 +3,9 @@ use std::fs::File;
 use rustc_hash::FxHashMap;
 
 struct StationData {
-    min_report: f64,
-    max_report: f64,
-    report_sum: f64,
+    min_report: i64,
+    max_report: i64,
+    report_sum: i64,
     report_count: usize,
 }
 
@@ -34,18 +34,23 @@ unsafe fn compute(text: &[u8]) {
             b'\n' => {
                 let name =
                     std::str::from_utf8_unchecked(&text[start_of_line_index..separator_index]);
-                let mut reported_value =
-                    parse_fixed_point_number(text.as_ptr().wrapping_add(current_index - 1));
+
                 let is_neg = *text.get_unchecked(separator_index + 1) == b'-';
-                reported_value *= !is_neg as i64 * 1 + is_neg as i64 * -1;
-                let report_value = reported_value as f64 / 10.0;
+                let num_len = current_index - separator_index - 3 - is_neg as usize;
+                let mut report_value = parse_2_digit_number(
+                    &text[separator_index + 1 - (2 - num_len) + is_neg as usize] as *const u8,
+                    num_len,
+                ) as i64
+                    * 10;
+                report_value += convert_from_ascii(*text.get_unchecked(current_index - 1));
+                report_value *= !is_neg as i64 * 1 + is_neg as i64 * -1;
 
                 let entry = match reports_map.entry(name) {
                     std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
                     std::collections::hash_map::Entry::Vacant(v) => v.insert(StationData {
-                        min_report: f64::MAX,
-                        max_report: f64::MIN,
-                        report_sum: 0.0,
+                        min_report: i64::MAX,
+                        max_report: i64::MIN,
+                        report_sum: 0,
                         report_count: 0,
                     }),
                 };
@@ -80,11 +85,11 @@ unsafe fn compute(text: &[u8]) {
             add_comma = true;
         }
 
-        let avg = (report.report_sum / report.report_count as f64 * 10.0).round() / 10.0;
+        let avg = (report.report_sum as f64 / 10.0 / report.report_count as f64 * 10.0).round() / 10.0;
         output_str.push_str(
             format!(
                 "{}={:.1}/{:.1}/{:.1}",
-                name, report.min_report, avg, report.max_report
+                name, report.min_report as f64 / 10.0, avg, report.max_report as f64 / 10.0 
             )
             .as_str(),
         );
@@ -96,18 +101,22 @@ unsafe fn compute(text: &[u8]) {
 }
 
 #[inline(always)]
-unsafe fn parse_fixed_point_number(end_of_num_char: *const u8) -> i64 {
-    let mut number = 0;
-    let mut position = 1;
+unsafe fn parse_2_digit_number(ptr: *const u8, len: usize) -> u16 {
+    const ZERO_MASK: u16 = 0x3030;
 
-    for index in 0..=4 {
-        let char = *(end_of_num_char.wrapping_sub(index));
-        let is_good = char >= b'0' && char <= b'9';
-        number += convert_from_ascii(char) as i64 * is_good as i64 * position;
-        position *= (1 * !is_good as i64) + (10 * is_good as i64);
-    }
+    let general_mask: u16 = !(0xFFFF_u32 >> (len as u32 * 8)) as u16;
 
-    number
+    let mut number: u16 = (ptr as *const u16).read_unaligned();
+    number &= general_mask;
+
+    number -= ZERO_MASK & general_mask;
+
+    let lower_digit = (number >> 8) & 0xFF;
+    let upper_digit = ((number) & 0xFF) * 10;
+
+    let result = lower_digit + upper_digit;
+
+    result
 }
 
 #[inline(always)]
