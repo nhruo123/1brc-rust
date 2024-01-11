@@ -1,4 +1,7 @@
-use std::fs::File;
+use std::{
+    fs::File,
+    thread::{self, available_parallelism},
+};
 
 use rustc_hash::FxHashMap;
 
@@ -13,24 +16,81 @@ const MEASUREMENTS_FILE_PATH: &str = "../1brc/measurements.txt";
 
 fn main() {
     let file = File::open(MEASUREMENTS_FILE_PATH).unwrap();
+    let task_count: usize = available_parallelism().unwrap().into();
     unsafe {
         let mmap = memmap2::MmapOptions::new()
             .map_copy_read_only(&file)
             .unwrap();
 
-        compute(&mmap);
+        let file_size = mmap.len();
+        let segment_size = file_size / task_count;
+
+        let result_map = thread::scope(|s| {
+            let mut tasks = Vec::new();
+            let buffer = &mmap;
+            for index in 1..task_count - 1 {
+                tasks.push(s.spawn(move || compute(buffer, index * segment_size, segment_size)));
+            }
+            tasks.push(s.spawn(move || {
+                compute(
+                    buffer,
+                    (task_count - 1) * segment_size,
+                    segment_size + file_size % task_count,
+                )
+            }));
+
+            let mut result_map = compute(buffer, 0, segment_size);
+
+            for result in tasks {
+                let result = result.join().unwrap();
+                for (key, value) in result {
+                    let entry = match result_map.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(v) => v.insert(StationData {
+                            min_report: i64::MAX,
+                            max_report: i64::MIN,
+                            report_sum: 0,
+                            report_count: 0,
+                        }),
+                    };
+
+                    entry.max_report = entry.max_report.max(value.max_report);
+                    entry.min_report = entry.min_report.min(value.min_report);
+                    entry.report_sum += value.report_sum;
+                    entry.report_count += value.report_count;
+                }
+            }
+
+            result_map
+        });
+
+        let reports_array = to_vec(result_map);
+        print_result(reports_array);
     }
 }
 
-unsafe fn compute(text: &[u8]) {
+unsafe fn compute(
+    text: &[u8],
+    start_offset: usize,
+    len: usize,
+) -> FxHashMap<&str, StationData> {
     let mut reports_map = FxHashMap::<&str, StationData>::default();
 
-    let mut start_of_line_index = 0;
-    let mut separator_index = 0;
-    let mut current_index = 0;
+    let mut current_index = start_offset;
 
-    while current_index < text.len() {
-        match &text[current_index] {
+    if current_index > 0 {
+        while *text.get_unchecked(current_index) != b'\n' {
+           current_index += 1; 
+        }
+        current_index +=1;
+    }
+
+    let mut start_of_line_index = current_index;
+    let mut separator_index = current_index;
+
+
+    while current_index < start_offset + len || (start_offset + len < text.len() && *text.get_unchecked(current_index - 1) != b'\n'){
+        match text.get_unchecked(current_index) {
             b'\n' => {
                 let name = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
                     text.as_ptr().offset(start_of_line_index as _),
@@ -44,6 +104,7 @@ unsafe fn compute(text: &[u8]) {
                     num_len,
                 ) as i64
                     * 10;
+
                 report_value += convert_from_ascii(*text.get_unchecked(current_index - 1));
                 report_value *= !is_neg as i64 * 1 + is_neg as i64 * -1;
 
@@ -62,8 +123,7 @@ unsafe fn compute(text: &[u8]) {
                 entry.report_sum += report_value;
                 entry.report_count += 1;
 
-                current_index += 1;
-                start_of_line_index = current_index;
+                start_of_line_index = current_index + 1;
             }
             b';' => {
                 separator_index = current_index;
@@ -72,9 +132,9 @@ unsafe fn compute(text: &[u8]) {
         }
         current_index += 1;
     }
-    let reports_array = to_vec(reports_map);
 
-    print_result(reports_array);
+
+    reports_map
 }
 
 fn print_result(reports_array: Vec<(&str, StationData)>) {
@@ -109,19 +169,13 @@ fn print_result(reports_array: Vec<(&str, StationData)>) {
     println!("{}", output_str);
 }
 
-fn to_vec(
-    reports_map: std::collections::HashMap<
-        &str,
-        StationData,
-        std::hash::BuildHasherDefault<rustc_hash::FxHasher>,
-    >,
-) -> Vec<(&str, StationData)> {
+fn to_vec(reports_map: FxHashMap<&str, StationData>) -> Vec<(&str, StationData)> {
     let mut reports_array = reports_map.into_iter().collect::<Vec<_>>();
     reports_array.sort_by(|a, b| a.0.cmp(b.0));
     reports_array
 }
 
-// #[inline(always)]
+#[inline(always)]
 unsafe fn parse_2_digit_number(ptr: *const u8, len: usize) -> u16 {
     const ZERO_MASK: u16 = 0x3030;
 

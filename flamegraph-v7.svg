@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="534" onload="init(evt)" viewBox="0 0 1200 534" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="534" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">Flame Graph</text><text id="details" fill="rgb(0,0,0)" x="10" y="517.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="517.00"> </text><svg id="frames" x="10" width="1180" total_samples="420262"><g><title>rust-1brc.exe`core::ptr::const_ptr::impl$0::offset (227 samples, 0.05%)</title><rect x="3.6023%" y="229" width="0.0540%" height="15" fill="rgb(227,0,7)" fg:x="15139" fg:w="227"/><text x="3.8523%" y="239.50"></text></g><g><title>rust-1brc.exe`rust_1brc::parse_2_digit_number (1,346 samples, 0.32%)</title><rect x="3.6610%" y="229" width="0.3203%" height="15" fill="rgb(217,0,24)" fg:x="15386" fg:w="1346"/><text x="3.9110%" y="239.50"></text></g><g><title>rust-1brc.exe`core::array::impl$7::try_from (54 samples, 0.01%)</title><rect x="4.1296%" y="69" width="0.0128%" height="15" fill="rgb(221,193,54)" fg:x="17355" fg:w="54"/><text x="4.3796%" y="79.50"></text></g><g><title>rust-1brc.exe`core::result::Result::map (54 samples, 0.01%)</title><rect x="4.1296%" y="53" width="0.0128%" height="15" fill="rgb(248,212,6)" fg:x="17355" fg:w="54"/><text x="4.3796%" y="63.50"></text></g><g><title>rust-1brc.exe`core::convert::impl$6::try_into (210 samples, 0.05%)</title><rect x="4.1296%" y="85" width="0.0500%" height="15" fill="rgb(208,68,35)" fg:x="17355" fg:w="210"/><text x="4.3796%" y="95.50"></text></g><g><title>rust-1brc.exe`core::num::impl$11::rotate_left (156 samples, 0.04%)</title><rect x="4.1424%" y="69" width="0.0371%" height="15" fill="rgb(232,128,0)" fg:x="17409" fg:w="156"/><text x="4.3924%" y="79.50"></text></g><g><title>rust-1brc.exe`core::slice::index::impl$0::index (154 samples, 0.04%)</title><rect x="4.1795%" y="85" width="0.0366%" height="15" fill="rgb(207,160,47)" fg:x="17565" fg:w="154"/><text x="4.4295%" y="95.50"></text></g><g><title>rust-1brc.exe`core::slice::index::impl$6::index (154 samples, 0.04%)</title><rect x="4.1795%" y="69" width="0.0366%" height="15" fill="rgb(228,23,34)" fg:x="17565" fg:w="154"/><text x="4.4295%" y="79.50"></text></g><g><title>rust-1brc.exe`core::slice::index::impl$6::get_unchecked (154 samples, 0.04%)</title><rect x="4.1795%" y="53" width="0.0366%" height="15" fill="rgb(218,30,26)" fg:x="17565" fg:w="154"/><text x="4.4295%" y="63.50"></text></g><g><title>rust-1brc.exe`core::slice::index::impl$4::get_unchecked (154 samples, 0.04%)</title><rect x="4.1795%" y="37" width="0.0366%" height="15" fill="rgb(220,122,19)" fg:x="17565" fg:w="154"/><text x="4.4295%" y="47.50"></text></g><g><title>rust-1brc.exe`rustc_hash::impl$2::write (1,189 samples, 0.28%)</title><rect x="3.9813%" y="101" width="0.2829%" height="15" fill="rgb(250,228,42)" fg:x="16732" fg:w="1189"/><text x="4.2313%" y="111.50"></text></g><g><title>rust-1brc.exe`rustc_hash::FxHasher::add_to_hash (202 samples, 0.05%)</title><rect x="4.2162%" y="85" width="0.0481%" height="15" fill="rgb(240,193,28)" fg:x="17719" fg:w="202"/><text x="4.4662%" y="95.50"></text></g><g><title>rust-1brc.exe`core::num::impl$11::rotate_left (202 samples, 0.05%)</title><rect x="4.2162%" y="69" width="0.0481%" height="15" fill="rgb(216,20,37)" fg:x="17719" fg:w="202"/><text x="4.4662%" y="79.50"></text></g><g><title>rust-1brc.exe`hashbrown::map::make_hash (1,476 samples, 0.35%)</title><rect x="3.9813%" y="197" width="0.3512%" height="15" fill="rgb(206,188,39)" fg:x="16732" fg:w="1476"/><text x="4.2313%" y="207.50"></text></g><g><title>rust-1brc.exe`core::hash::BuildHasher::hash_one (1,476 samples, 0.35%)</title><rect x="3.9813%" y="181" width="0.3512%" height="15" fill="rgb(217,207,13)" fg:x="16732" fg:w="1476"/><text x="4.2313%" y="191.50"></text></g><g><title>rust-1brc.exe`core::hash::impls::impl$5::hash (1,476 samples, 0.35%)</title><rect x="3.9813%" y="165" width="0.3512%" height="15" fill="rgb(231,73,38)" fg:x="16732" fg:w="1476"/><text x="4.2313%" y="175.50"></text></g><g><title>rust-1brc.exe`core::hash::impls::impl$5::hash (1,476 samples, 0.35%)</title><rect x="3.9813%" y="149" width="0.3512%" height="15" fill="rgb(225,20,46)" fg:x="16732" fg:w="1476"/><text x="4.2313%" y="159.50"></text></g><g><title>rust-1brc.exe`core::hash::impls::impl$2::hash (1,476 samples, 0.35%)</title><rect x="3.9813%" y="133" width="0.3512%" height="15" fill="rgb(210,31,41)" fg:x="16732" fg:w="1476"/><text x="4.2313%" y="143.50"></text></g><g><title>rust-1brc.exe`core::hash::Hasher::write_str (1,476 samples, 0.35%)</title><rect x="3.9813%" y="117" width="0.3512%" height="15" fill="rgb(221,200,47)" fg:x="16732" fg:w="1476"/><text x="4.2313%" y="127.50"></text></g><g><title>rust-1brc.exe`rustc_hash::impl$2::write_u8 (287 samples, 0.07%)</title><rect x="4.2642%" y="101" width="0.0683%" height="15" fill="rgb(226,26,5)" fg:x="17921" fg:w="287"/><text x="4.5142%" y="111.50"></text></g><g><title>rust-1brc.exe`rustc_hash::FxHasher::add_to_hash (287 samples, 0.07%)</title><rect x="4.2642%" y="85" width="0.0683%" height="15" fill="rgb(249,33,26)" fg:x="17921" fg:w="287"/><text x="4.5142%" y="95.50"></text></g><g><title>rust-1brc.exe`core::num::impl$11::rotate_left (287 samples, 0.07%)</title><rect x="4.2642%" y="69" width="0.0683%" height="15" fill="rgb(235,183,28)" fg:x="17921" fg:w="287"/><text x="4.5142%" y="79.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::bitmask::impl$3::next (92 samples, 0.02%)</title><rect x="4.4755%" y="165" width="0.0219%" height="15" fill="rgb(221,5,38)" fg:x="18809" fg:w="92"/><text x="4.7255%" y="175.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::bitmask::BitMask::lowest_set_bit (92 samples, 0.02%)</title><rect x="4.4755%" y="149" width="0.0219%" height="15" fill="rgb(247,18,42)" fg:x="18809" fg:w="92"/><text x="4.7255%" y="159.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::h2 (898 samples, 0.21%)</title><rect x="4.4974%" y="165" width="0.2137%" height="15" fill="rgb(241,131,45)" fg:x="18901" fg:w="898"/><text x="4.7474%" y="175.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::RawTable::bucket (387 samples, 0.09%)</title><rect x="5.0335%" y="149" width="0.0921%" height="15" fill="rgb(249,31,29)" fg:x="21154" fg:w="387"/><text x="5.2835%" y="159.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::Bucket::from_base_index (387 samples, 0.09%)</title><rect x="5.0335%" y="133" width="0.0921%" height="15" fill="rgb(225,111,53)" fg:x="21154" fg:w="387"/><text x="5.2835%" y="143.50"></text></g><g><title>rust-1brc.exe`core::ptr::mut_ptr::impl$0::sub (387 samples, 0.09%)</title><rect x="5.0335%" y="117" width="0.0921%" height="15" fill="rgb(238,160,17)" fg:x="21154" fg:w="387"/><text x="5.2835%" y="127.50"></text></g><g><title>rust-1brc.exe`core::ptr::mut_ptr::impl$0::offset (288 samples, 0.07%)</title><rect x="5.0571%" y="101" width="0.0685%" height="15" fill="rgb(214,148,48)" fg:x="21253" fg:w="288"/><text x="5.3071%" y="111.50"></text></g><g><title>`0x7FFD6B171219 (90 samples, 0.02%)</title><rect x="5.2177%" y="53" width="0.0214%" height="15" fill="rgb(232,36,49)" fg:x="21928" fg:w="90"/><text x="5.4677%" y="63.50"></text></g><g><title>`0x7FFD6B171220 (128 samples, 0.03%)</title><rect x="5.2422%" y="53" width="0.0305%" height="15" fill="rgb(209,103,24)" fg:x="22031" fg:w="128"/><text x="5.4922%" y="63.50"></text></g><g><title>`0x7FFD6B171222 (638 samples, 0.15%)</title><rect x="5.2727%" y="53" width="0.1518%" height="15" fill="rgb(229,88,8)" fg:x="22159" fg:w="638"/><text x="5.5227%" y="63.50"></text></g><g><title>`0x7FFD6B171227 (122 samples, 0.03%)</title><rect x="5.4245%" y="53" width="0.0290%" height="15" fill="rgb(213,181,19)" fg:x="22797" fg:w="122"/><text x="5.6745%" y="63.50"></text></g><g><title>`0x7FFD6B17122D (58 samples, 0.01%)</title><rect x="5.4559%" y="53" width="0.0138%" height="15" fill="rgb(254,191,54)" fg:x="22929" fg:w="58"/><text x="5.7059%" y="63.50"></text></g><g><title>`0x7FFD6B171232 (227 samples, 0.05%)</title><rect x="5.4697%" y="53" width="0.0540%" height="15" fill="rgb(241,83,37)" fg:x="22987" fg:w="227"/><text x="5.7197%" y="63.50"></text></g><g><title>`0x7FFD6B171235 (92 samples, 0.02%)</title><rect x="5.5237%" y="53" width="0.0219%" height="15" fill="rgb(233,36,39)" fg:x="23214" fg:w="92"/><text x="5.7737%" y="63.50"></text></g><g><title>`0x7FFD6B171239 (268 samples, 0.06%)</title><rect x="5.5456%" y="53" width="0.0638%" height="15" fill="rgb(226,3,54)" fg:x="23306" fg:w="268"/><text x="5.7956%" y="63.50"></text></g><g><title>`0x7FFD6B17123B (127 samples, 0.03%)</title><rect x="5.6094%" y="53" width="0.0302%" height="15" fill="rgb(245,192,40)" fg:x="23574" fg:w="127"/><text x="5.8594%" y="63.50"></text></g><g><title>`0x7FFD6B171240 (167 samples, 0.04%)</title><rect x="5.6396%" y="53" width="0.0397%" height="15" fill="rgb(238,167,29)" fg:x="23701" fg:w="167"/><text x="5.8896%" y="63.50"></text></g><g><title>`0x7FFD6B171242 (928 samples, 0.22%)</title><rect x="5.6793%" y="53" width="0.2208%" height="15" fill="rgb(232,182,51)" fg:x="23868" fg:w="928"/><text x="5.9293%" y="63.50"></text></g><g><title>`0x7FFD6B171247 (426 samples, 0.10%)</title><rect x="5.9001%" y="53" width="0.1014%" height="15" fill="rgb(231,60,39)" fg:x="24796" fg:w="426"/><text x="6.1501%" y="63.50"></text></g><g><title>`0x7FFD6B17124A (83 samples, 0.02%)</title><rect x="6.0015%" y="53" width="0.0197%" height="15" fill="rgb(208,69,12)" fg:x="25222" fg:w="83"/><text x="6.2515%" y="63.50"></text></g><g><title>`0x7FFD6B17129E (47 samples, 0.01%)</title><rect x="6.0474%" y="53" width="0.0112%" height="15" fill="rgb(235,93,37)" fg:x="25415" fg:w="47"/><text x="6.2974%" y="63.50"></text></g><g><title>`0x7FFD6B1712A9 (53 samples, 0.01%)</title><rect x="6.0726%" y="53" width="0.0126%" height="15" fill="rgb(213,116,39)" fg:x="25521" fg:w="53"/><text x="6.3226%" y="63.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::impl$7::find::closure$0 (5,928 samples, 1.41%)</title><rect x="4.7111%" y="165" width="1.4105%" height="15" fill="rgb(222,207,29)" fg:x="19799" fg:w="5928"/><text x="4.9611%" y="175.50"></text></g><g><title>rust-1brc.exe`hashbrown::rustc_entry::impl$0::rustc_entry::closure$0 (4,186 samples, 1.00%)</title><rect x="5.1256%" y="149" width="0.9960%" height="15" fill="rgb(206,96,30)" fg:x="21541" fg:w="4186"/><text x="5.3756%" y="159.50"></text></g><g><title>rust-1brc.exe`core::cmp::impls::impl$9::eq (4,186 samples, 1.00%)</title><rect x="5.1256%" y="133" width="0.9960%" height="15" fill="rgb(218,138,4)" fg:x="21541" fg:w="4186"/><text x="5.3756%" y="143.50"></text></g><g><title>rust-1brc.exe`core::str::traits::impl$1::eq (4,186 samples, 1.00%)</title><rect x="5.1256%" y="117" width="0.9960%" height="15" fill="rgb(250,191,14)" fg:x="21541" fg:w="4186"/><text x="5.3756%" y="127.50"></text></g><g><title>rust-1brc.exe`core::cmp::impls::impl$9::eq (4,186 samples, 1.00%)</title><rect x="5.1256%" y="101" width="0.9960%" height="15" fill="rgb(239,60,40)" fg:x="21541" fg:w="4186"/><text x="5.3756%" y="111.50"></text></g><g><title>rust-1brc.exe`core::slice::cmp::impl$0::eq (4,186 samples, 1.00%)</title><rect x="5.1256%" y="85" width="0.9960%" height="15" fill="rgb(206,27,48)" fg:x="21541" fg:w="4186"/><text x="5.3756%" y="95.50"></text></g><g><title>rust-1brc.exe`core::slice::cmp::impl$5::equal (4,186 samples, 1.00%)</title><rect x="5.1256%" y="69" width="0.9960%" height="15" fill="rgb(225,35,8)" fg:x="21541" fg:w="4186"/><text x="5.3756%" y="79.50"></text></g><g><title>rust-1brc.exe`memcmp (144 samples, 0.03%)</title><rect x="6.0874%" y="53" width="0.0343%" height="15" fill="rgb(250,213,24)" fg:x="25583" fg:w="144"/><text x="6.3374%" y="63.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::sse2::Group::load (78 samples, 0.02%)</title><rect x="6.1217%" y="165" width="0.0186%" height="15" fill="rgb(247,123,22)" fg:x="25727" fg:w="78"/><text x="6.3717%" y="175.50"></text></g><g><title>rust-1brc.exe`core::core_arch::x86::sse2::_mm_loadu_si128 (78 samples, 0.02%)</title><rect x="6.1217%" y="149" width="0.0186%" height="15" fill="rgb(231,138,38)" fg:x="25727" fg:w="78"/><text x="6.3717%" y="159.50"></text></g><g><title>rust-1brc.exe`core::intrinsics::copy_nonoverlapping (78 samples, 0.02%)</title><rect x="6.1217%" y="133" width="0.0186%" height="15" fill="rgb(231,145,46)" fg:x="25727" fg:w="78"/><text x="6.3717%" y="143.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::sse2::Group::match_byte (566 samples, 0.13%)</title><rect x="6.1402%" y="165" width="0.1347%" height="15" fill="rgb(251,118,11)" fg:x="25805" fg:w="566"/><text x="6.3902%" y="175.50"></text></g><g><title>rust-1brc.exe`core::core_arch::x86::sse2::_mm_movemask_epi8 (566 samples, 0.13%)</title><rect x="6.1402%" y="149" width="0.1347%" height="15" fill="rgb(217,147,25)" fg:x="25805" fg:w="566"/><text x="6.3902%" y="159.50"></text></g><g><title>rust-1brc.exe`std::collections::hash::map::HashMap::entry (9,649 samples, 2.30%)</title><rect x="3.9813%" y="229" width="2.2959%" height="15" fill="rgb(247,81,37)" fg:x="16732" fg:w="9649"/><text x="4.2313%" y="239.50">r..</text></g><g><title>rust-1brc.exe`hashbrown::map::HashMap::rustc_entry (9,649 samples, 2.30%)</title><rect x="3.9813%" y="213" width="2.2959%" height="15" fill="rgb(209,12,38)" fg:x="16732" fg:w="9649"/><text x="4.2313%" y="223.50">r..</text></g><g><title>rust-1brc.exe`hashbrown::raw::RawTable::find (8,173 samples, 1.94%)</title><rect x="4.3325%" y="197" width="1.9447%" height="15" fill="rgb(227,1,9)" fg:x="18208" fg:w="8173"/><text x="4.5825%" y="207.50">r..</text></g><g><title>rust-1brc.exe`hashbrown::raw::RawTableInner::find_inner (7,898 samples, 1.88%)</title><rect x="4.3980%" y="181" width="1.8793%" height="15" fill="rgb(248,47,43)" fg:x="18483" fg:w="7898"/><text x="4.6480%" y="191.50">r..</text></g><g><title>rust-1brc.exe`rust_1brc::compute (26,408 samples, 6.28%)</title><rect x="0.0052%" y="245" width="6.2837%" height="15" fill="rgb(221,10,30)" fg:x="22" fg:w="26408"/><text x="0.2552%" y="255.50">rust-1br..</text></g><g><title>rust-1brc.exe`std::collections::hash::map::OccupiedEntry::into_mut (49 samples, 0.01%)</title><rect x="6.2773%" y="229" width="0.0117%" height="15" fill="rgb(210,229,1)" fg:x="26381" fg:w="49"/><text x="6.5273%" y="239.50"></text></g><g><title>rust-1brc.exe`hashbrown::rustc_entry::RustcOccupiedEntry::into_mut (49 samples, 0.01%)</title><rect x="6.2773%" y="213" width="0.0117%" height="15" fill="rgb(222,148,37)" fg:x="26381" fg:w="49"/><text x="6.5273%" y="223.50"></text></g><g><title>rust-1brc.exe`__scrt_common_main_seh() (26,428 samples, 6.29%)</title><rect x="0.0014%" y="437" width="6.2885%" height="15" fill="rgb(234,67,33)" fg:x="6" fg:w="26428"/><text x="0.2514%" y="447.50">rust-1br..</text></g><g><title>rust-1brc.exe`invoke_main() (26,422 samples, 6.29%)</title><rect x="0.0029%" y="421" width="6.2870%" height="15" fill="rgb(247,98,35)" fg:x="12" fg:w="26422"/><text x="0.2529%" y="431.50">rust-1br..</text></g><g><title>rust-1brc.exe`main (26,421 samples, 6.29%)</title><rect x="0.0031%" y="405" width="6.2868%" height="15" fill="rgb(247,138,52)" fg:x="13" fg:w="26421"/><text x="0.2531%" y="415.50">rust-1br..</text></g><g><title>rust-1brc.exe`std::sys_common::backtrace::__rust_begin_short_backtrace&lt;void (*)(),tuple$&lt;&gt; &gt; (26,421 samples, 6.29%)</title><rect x="0.0031%" y="389" width="6.2868%" height="15" fill="rgb(213,79,30)" fg:x="13" fg:w="26421"/><text x="0.2531%" y="399.50">rust-1br..</text></g><g><title>rust-1brc.exe`rust_1brc::main (26,421 samples, 6.29%)</title><rect x="0.0031%" y="373" width="6.2868%" height="15" fill="rgb(246,177,23)" fg:x="13" fg:w="26421"/><text x="0.2531%" y="383.50">rust-1br..</text></g><g><title>rust-1brc.exe`std::thread::scoped::scope (26,414 samples, 6.29%)</title><rect x="0.0048%" y="357" width="6.2851%" height="15" fill="rgb(230,62,27)" fg:x="20" fg:w="26414"/><text x="0.2548%" y="367.50">rust-1br..</text></g><g><title>rust-1brc.exe`std::panic::catch_unwind (26,414 samples, 6.29%)</title><rect x="0.0048%" y="341" width="6.2851%" height="15" fill="rgb(216,154,8)" fg:x="20" fg:w="26414"/><text x="0.2548%" y="351.50">rust-1br..</text></g><g><title>rust-1brc.exe`std::panicking::try (26,414 samples, 6.29%)</title><rect x="0.0048%" y="325" width="6.2851%" height="15" fill="rgb(244,35,45)" fg:x="20" fg:w="26414"/><text x="0.2548%" y="335.50">rust-1br..</text></g><g><title>rust-1brc.exe`std::panicking::try::do_call (26,414 samples, 6.29%)</title><rect x="0.0048%" y="309" width="6.2851%" height="15" fill="rgb(251,115,12)" fg:x="20" fg:w="26414"/><text x="0.2548%" y="319.50">rust-1br..</text></g><g><title>rust-1brc.exe`core::panic::unwind_safe::impl$23::call_once (26,414 samples, 6.29%)</title><rect x="0.0048%" y="293" width="6.2851%" height="15" fill="rgb(240,54,50)" fg:x="20" fg:w="26414"/><text x="0.2548%" y="303.50">rust-1br..</text></g><g><title>rust-1brc.exe`std::thread::scoped::scope::closure$0 (26,414 samples, 6.29%)</title><rect x="0.0048%" y="277" width="6.2851%" height="15" fill="rgb(233,84,52)" fg:x="20" fg:w="26414"/><text x="0.2548%" y="287.50">rust-1br..</text></g><g><title>rust-1brc.exe`rust_1brc::main::closure$0 (26,414 samples, 6.29%)</title><rect x="0.0048%" y="261" width="6.2851%" height="15" fill="rgb(207,117,47)" fg:x="20" fg:w="26414"/><text x="0.2548%" y="271.50">rust-1br..</text></g><g><title>rust-1brc.exe`core::ptr::const_ptr::impl$0::offset (2,860 samples, 0.68%)</title><rect x="56.1345%" y="277" width="0.6805%" height="15" fill="rgb(249,43,39)" fg:x="235912" fg:w="2860"/><text x="56.3845%" y="287.50"></text></g><g><title>rust-1brc.exe`rust_1brc::convert_from_ascii (238 samples, 0.06%)</title><rect x="56.8150%" y="277" width="0.0566%" height="15" fill="rgb(209,38,44)" fg:x="238772" fg:w="238"/><text x="57.0650%" y="287.50"></text></g><g><title>rust-1brc.exe`core::num::impl$6::wrapping_sub (209 samples, 0.05%)</title><rect x="56.8219%" y="261" width="0.0497%" height="15" fill="rgb(236,212,23)" fg:x="238801" fg:w="209"/><text x="57.0719%" y="271.50"></text></g><g><title>rust-1brc.exe`rust_1brc::parse_2_digit_number (18,138 samples, 4.32%)</title><rect x="56.8717%" y="277" width="4.3159%" height="15" fill="rgb(242,79,21)" fg:x="239010" fg:w="18138"/><text x="57.1217%" y="287.50">rust-..</text></g><g><title>rust-1brc.exe`core::array::impl$7::try_from (1,071 samples, 0.25%)</title><rect x="63.2168%" y="117" width="0.2548%" height="15" fill="rgb(211,96,35)" fg:x="265676" fg:w="1071"/><text x="63.4668%" y="127.50"></text></g><g><title>rust-1brc.exe`core::result::Result::map (1,071 samples, 0.25%)</title><rect x="63.2168%" y="101" width="0.2548%" height="15" fill="rgb(253,215,40)" fg:x="265676" fg:w="1071"/><text x="63.4668%" y="111.50"></text></g><g><title>rust-1brc.exe`core::convert::impl$6::try_into (3,309 samples, 0.79%)</title><rect x="63.2168%" y="133" width="0.7874%" height="15" fill="rgb(211,81,21)" fg:x="265676" fg:w="3309"/><text x="63.4668%" y="143.50"></text></g><g><title>rust-1brc.exe`core::num::impl$11::rotate_left (2,238 samples, 0.53%)</title><rect x="63.4716%" y="117" width="0.5325%" height="15" fill="rgb(208,190,38)" fg:x="266747" fg:w="2238"/><text x="63.7216%" y="127.50"></text></g><g><title>rust-1brc.exe`core::slice::index::impl$0::index (2,012 samples, 0.48%)</title><rect x="64.0041%" y="133" width="0.4787%" height="15" fill="rgb(235,213,38)" fg:x="268985" fg:w="2012"/><text x="64.2541%" y="143.50"></text></g><g><title>rust-1brc.exe`core::slice::index::impl$6::index (2,012 samples, 0.48%)</title><rect x="64.0041%" y="117" width="0.4787%" height="15" fill="rgb(237,122,38)" fg:x="268985" fg:w="2012"/><text x="64.2541%" y="127.50"></text></g><g><title>rust-1brc.exe`core::slice::index::impl$6::get_unchecked (2,012 samples, 0.48%)</title><rect x="64.0041%" y="101" width="0.4787%" height="15" fill="rgb(244,218,35)" fg:x="268985" fg:w="2012"/><text x="64.2541%" y="111.50"></text></g><g><title>rust-1brc.exe`core::slice::index::impl$4::get_unchecked (2,012 samples, 0.48%)</title><rect x="64.0041%" y="85" width="0.4787%" height="15" fill="rgb(240,68,47)" fg:x="268985" fg:w="2012"/><text x="64.2541%" y="95.50"></text></g><g><title>rust-1brc.exe`core::ptr::const_ptr::impl$0::add (64 samples, 0.02%)</title><rect x="64.4676%" y="69" width="0.0152%" height="15" fill="rgb(210,16,53)" fg:x="270933" fg:w="64"/><text x="64.7176%" y="79.50"></text></g><g><title>rust-1brc.exe`rustc_hash::impl$2::write (17,039 samples, 4.05%)</title><rect x="61.1875%" y="149" width="4.0544%" height="15" fill="rgb(235,124,12)" fg:x="257148" fg:w="17039"/><text x="61.4375%" y="159.50">rust..</text></g><g><title>rust-1brc.exe`rustc_hash::FxHasher::add_to_hash (3,190 samples, 0.76%)</title><rect x="64.4829%" y="133" width="0.7591%" height="15" fill="rgb(224,169,11)" fg:x="270997" fg:w="3190"/><text x="64.7329%" y="143.50"></text></g><g><title>rust-1brc.exe`core::num::impl$11::rotate_left (3,190 samples, 0.76%)</title><rect x="64.4829%" y="117" width="0.7591%" height="15" fill="rgb(250,166,2)" fg:x="270997" fg:w="3190"/><text x="64.7329%" y="127.50"></text></g><g><title>rust-1brc.exe`hashbrown::map::make_hash (21,129 samples, 5.03%)</title><rect x="61.1875%" y="245" width="5.0276%" height="15" fill="rgb(242,216,29)" fg:x="257148" fg:w="21129"/><text x="61.4375%" y="255.50">rust-1..</text></g><g><title>rust-1brc.exe`core::hash::BuildHasher::hash_one (21,129 samples, 5.03%)</title><rect x="61.1875%" y="229" width="5.0276%" height="15" fill="rgb(230,116,27)" fg:x="257148" fg:w="21129"/><text x="61.4375%" y="239.50">rust-1..</text></g><g><title>rust-1brc.exe`core::hash::impls::impl$5::hash (21,129 samples, 5.03%)</title><rect x="61.1875%" y="213" width="5.0276%" height="15" fill="rgb(228,99,48)" fg:x="257148" fg:w="21129"/><text x="61.4375%" y="223.50">rust-1..</text></g><g><title>rust-1brc.exe`core::hash::impls::impl$5::hash (21,129 samples, 5.03%)</title><rect x="61.1875%" y="197" width="5.0276%" height="15" fill="rgb(253,11,6)" fg:x="257148" fg:w="21129"/><text x="61.4375%" y="207.50">rust-1..</text></g><g><title>rust-1brc.exe`core::hash::impls::impl$2::hash (21,129 samples, 5.03%)</title><rect x="61.1875%" y="181" width="5.0276%" height="15" fill="rgb(247,143,39)" fg:x="257148" fg:w="21129"/><text x="61.4375%" y="191.50">rust-1..</text></g><g><title>rust-1brc.exe`core::hash::Hasher::write_str (21,129 samples, 5.03%)</title><rect x="61.1875%" y="165" width="5.0276%" height="15" fill="rgb(236,97,10)" fg:x="257148" fg:w="21129"/><text x="61.4375%" y="175.50">rust-1..</text></g><g><title>rust-1brc.exe`rustc_hash::impl$2::write_u8 (4,090 samples, 0.97%)</title><rect x="65.2419%" y="149" width="0.9732%" height="15" fill="rgb(233,208,19)" fg:x="274187" fg:w="4090"/><text x="65.4919%" y="159.50"></text></g><g><title>rust-1brc.exe`rustc_hash::FxHasher::add_to_hash (4,090 samples, 0.97%)</title><rect x="65.2419%" y="133" width="0.9732%" height="15" fill="rgb(216,164,2)" fg:x="274187" fg:w="4090"/><text x="65.4919%" y="143.50"></text></g><g><title>rust-1brc.exe`core::num::impl$11::rotate_left (4,090 samples, 0.97%)</title><rect x="65.2419%" y="117" width="0.9732%" height="15" fill="rgb(220,129,5)" fg:x="274187" fg:w="4090"/><text x="65.4919%" y="127.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::ProbeSeq::move_next (90 samples, 0.02%)</title><rect x="68.1549%" y="213" width="0.0214%" height="15" fill="rgb(242,17,10)" fg:x="286429" fg:w="90"/><text x="68.4049%" y="223.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::bitmask::impl$3::next (977 samples, 0.23%)</title><rect x="68.1763%" y="213" width="0.2325%" height="15" fill="rgb(242,107,0)" fg:x="286519" fg:w="977"/><text x="68.4263%" y="223.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::bitmask::BitMask::lowest_set_bit (977 samples, 0.23%)</title><rect x="68.1763%" y="197" width="0.2325%" height="15" fill="rgb(251,28,31)" fg:x="286519" fg:w="977"/><text x="68.4263%" y="207.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::h2 (12,852 samples, 3.06%)</title><rect x="68.4088%" y="213" width="3.0581%" height="15" fill="rgb(233,223,10)" fg:x="287496" fg:w="12852"/><text x="68.6588%" y="223.50">rus..</text></g><g><title>rust-1brc.exe`hashbrown::raw::RawTable::bucket (5,432 samples, 1.29%)</title><rect x="76.0528%" y="197" width="1.2925%" height="15" fill="rgb(215,21,27)" fg:x="319621" fg:w="5432"/><text x="76.3028%" y="207.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::Bucket::from_base_index (5,432 samples, 1.29%)</title><rect x="76.0528%" y="181" width="1.2925%" height="15" fill="rgb(232,23,21)" fg:x="319621" fg:w="5432"/><text x="76.3028%" y="191.50"></text></g><g><title>rust-1brc.exe`core::ptr::mut_ptr::impl$0::sub (5,432 samples, 1.29%)</title><rect x="76.0528%" y="165" width="1.2925%" height="15" fill="rgb(244,5,23)" fg:x="319621" fg:w="5432"/><text x="76.3028%" y="175.50"></text></g><g><title>rust-1brc.exe`core::ptr::mut_ptr::impl$0::offset (3,885 samples, 0.92%)</title><rect x="76.4209%" y="149" width="0.9244%" height="15" fill="rgb(226,81,46)" fg:x="321168" fg:w="3885"/><text x="76.6709%" y="159.50"></text></g><g><title>`0x7FFD6B171210 (67 samples, 0.02%)</title><rect x="78.6490%" y="101" width="0.0159%" height="15" fill="rgb(247,70,30)" fg:x="330532" fg:w="67"/><text x="78.8990%" y="111.50"></text></g><g><title>`0x7FFD6B171219 (1,067 samples, 0.25%)</title><rect x="78.6702%" y="101" width="0.2539%" height="15" fill="rgb(212,68,19)" fg:x="330621" fg:w="1067"/><text x="78.9202%" y="111.50"></text></g><g><title>`0x7FFD6B17121E (197 samples, 0.05%)</title><rect x="78.9241%" y="101" width="0.0469%" height="15" fill="rgb(240,187,13)" fg:x="331688" fg:w="197"/><text x="79.1741%" y="111.50"></text></g><g><title>`0x7FFD6B171220 (1,642 samples, 0.39%)</title><rect x="78.9710%" y="101" width="0.3907%" height="15" fill="rgb(223,113,26)" fg:x="331885" fg:w="1642"/><text x="79.2210%" y="111.50"></text></g><g><title>`0x7FFD6B171222 (8,893 samples, 2.12%)</title><rect x="79.3617%" y="101" width="2.1161%" height="15" fill="rgb(206,192,2)" fg:x="333527" fg:w="8893"/><text x="79.6117%" y="111.50">`..</text></g><g><title>`0x7FFD6B171227 (2,103 samples, 0.50%)</title><rect x="81.4777%" y="101" width="0.5004%" height="15" fill="rgb(241,108,4)" fg:x="342420" fg:w="2103"/><text x="81.7277%" y="111.50"></text></g><g><title>`0x7FFD6B17122A (168 samples, 0.04%)</title><rect x="81.9781%" y="101" width="0.0400%" height="15" fill="rgb(247,173,49)" fg:x="344523" fg:w="168"/><text x="82.2281%" y="111.50"></text></g><g><title>`0x7FFD6B17122D (806 samples, 0.19%)</title><rect x="82.0181%" y="101" width="0.1918%" height="15" fill="rgb(224,114,35)" fg:x="344691" fg:w="806"/><text x="82.2681%" y="111.50"></text></g><g><title>`0x7FFD6B171232 (2,667 samples, 0.63%)</title><rect x="82.2099%" y="101" width="0.6346%" height="15" fill="rgb(245,159,27)" fg:x="345497" fg:w="2667"/><text x="82.4599%" y="111.50"></text></g><g><title>`0x7FFD6B171235 (1,276 samples, 0.30%)</title><rect x="82.8445%" y="101" width="0.3036%" height="15" fill="rgb(245,172,44)" fg:x="348164" fg:w="1276"/><text x="83.0945%" y="111.50"></text></g><g><title>`0x7FFD6B171239 (3,668 samples, 0.87%)</title><rect x="83.1481%" y="101" width="0.8728%" height="15" fill="rgb(236,23,11)" fg:x="349440" fg:w="3668"/><text x="83.3981%" y="111.50"></text></g><g><title>`0x7FFD6B17123B (1,709 samples, 0.41%)</title><rect x="84.0209%" y="101" width="0.4067%" height="15" fill="rgb(205,117,38)" fg:x="353108" fg:w="1709"/><text x="84.2709%" y="111.50"></text></g><g><title>`0x7FFD6B171240 (2,363 samples, 0.56%)</title><rect x="84.4276%" y="101" width="0.5623%" height="15" fill="rgb(237,72,25)" fg:x="354817" fg:w="2363"/><text x="84.6776%" y="111.50"></text></g><g><title>`0x7FFD6B171242 (12,812 samples, 3.05%)</title><rect x="84.9898%" y="101" width="3.0486%" height="15" fill="rgb(244,70,9)" fg:x="357180" fg:w="12812"/><text x="85.2398%" y="111.50">`0x..</text></g><g><title>`0x7FFD6B171247 (6,071 samples, 1.44%)</title><rect x="88.0384%" y="101" width="1.4446%" height="15" fill="rgb(217,125,39)" fg:x="369992" fg:w="6071"/><text x="88.2884%" y="111.50"></text></g><g><title>`0x7FFD6B17124A (1,067 samples, 0.25%)</title><rect x="89.4830%" y="101" width="0.2539%" height="15" fill="rgb(235,36,10)" fg:x="376063" fg:w="1067"/><text x="89.7330%" y="111.50"></text></g><g><title>`0x7FFD6B17124F (389 samples, 0.09%)</title><rect x="89.7369%" y="101" width="0.0926%" height="15" fill="rgb(251,123,47)" fg:x="377130" fg:w="389"/><text x="89.9869%" y="111.50"></text></g><g><title>`0x7FFD6B171252 (179 samples, 0.04%)</title><rect x="89.8294%" y="101" width="0.0426%" height="15" fill="rgb(221,13,13)" fg:x="377519" fg:w="179"/><text x="90.0794%" y="111.50"></text></g><g><title>`0x7FFD6B17125A (363 samples, 0.09%)</title><rect x="89.8720%" y="101" width="0.0864%" height="15" fill="rgb(238,131,9)" fg:x="377698" fg:w="363"/><text x="90.1220%" y="111.50"></text></g><g><title>`0x7FFD6B17125E (274 samples, 0.07%)</title><rect x="89.9584%" y="101" width="0.0652%" height="15" fill="rgb(211,50,8)" fg:x="378061" fg:w="274"/><text x="90.2084%" y="111.50"></text></g><g><title>`0x7FFD6B171297 (351 samples, 0.08%)</title><rect x="90.0236%" y="101" width="0.0835%" height="15" fill="rgb(245,182,24)" fg:x="378335" fg:w="351"/><text x="90.2736%" y="111.50"></text></g><g><title>`0x7FFD6B17129E (806 samples, 0.19%)</title><rect x="90.1135%" y="101" width="0.1918%" height="15" fill="rgb(242,14,37)" fg:x="378713" fg:w="806"/><text x="90.3635%" y="111.50"></text></g><g><title>`0x7FFD6B1712A0 (320 samples, 0.08%)</title><rect x="90.3053%" y="101" width="0.0761%" height="15" fill="rgb(246,228,12)" fg:x="379519" fg:w="320"/><text x="90.5553%" y="111.50"></text></g><g><title>`0x7FFD6B1712A3 (436 samples, 0.10%)</title><rect x="90.3815%" y="101" width="0.1037%" height="15" fill="rgb(213,55,15)" fg:x="379839" fg:w="436"/><text x="90.6315%" y="111.50"></text></g><g><title>`0x7FFD6B1712A9 (729 samples, 0.17%)</title><rect x="90.4852%" y="101" width="0.1735%" height="15" fill="rgb(209,9,3)" fg:x="380275" fg:w="729"/><text x="90.7352%" y="111.50"></text></g><g><title>`0x7FFD6B1712B2 (124 samples, 0.03%)</title><rect x="90.6668%" y="101" width="0.0295%" height="15" fill="rgb(230,59,30)" fg:x="381038" fg:w="124"/><text x="90.9168%" y="111.50"></text></g><g><title>`0x7FFD6B1712B6 (49 samples, 0.01%)</title><rect x="90.6963%" y="101" width="0.0117%" height="15" fill="rgb(209,121,21)" fg:x="381162" fg:w="49"/><text x="90.9463%" y="111.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::impl$7::find::closure$0 (83,220 samples, 19.80%)</title><rect x="71.4668%" y="213" width="19.8019%" height="15" fill="rgb(220,109,13)" fg:x="300348" fg:w="83220"/><text x="71.7168%" y="223.50">rust-1brc.exe`hashbrown::raw::i..</text></g><g><title>rust-1brc.exe`hashbrown::rustc_entry::impl$0::rustc_entry::closure$0 (58,515 samples, 13.92%)</title><rect x="77.3453%" y="197" width="13.9235%" height="15" fill="rgb(232,18,1)" fg:x="325053" fg:w="58515"/><text x="77.5953%" y="207.50">rust-1brc.exe`hashbro..</text></g><g><title>rust-1brc.exe`core::cmp::impls::impl$9::eq (58,515 samples, 13.92%)</title><rect x="77.3453%" y="181" width="13.9235%" height="15" fill="rgb(215,41,42)" fg:x="325053" fg:w="58515"/><text x="77.5953%" y="191.50">rust-1brc.exe`core::c..</text></g><g><title>rust-1brc.exe`core::str::traits::impl$1::eq (58,515 samples, 13.92%)</title><rect x="77.3453%" y="165" width="13.9235%" height="15" fill="rgb(224,123,36)" fg:x="325053" fg:w="58515"/><text x="77.5953%" y="175.50">rust-1brc.exe`core::s..</text></g><g><title>rust-1brc.exe`core::cmp::impls::impl$9::eq (58,515 samples, 13.92%)</title><rect x="77.3453%" y="149" width="13.9235%" height="15" fill="rgb(240,125,3)" fg:x="325053" fg:w="58515"/><text x="77.5953%" y="159.50">rust-1brc.exe`core::c..</text></g><g><title>rust-1brc.exe`core::slice::cmp::impl$0::eq (58,515 samples, 13.92%)</title><rect x="77.3453%" y="133" width="13.9235%" height="15" fill="rgb(205,98,50)" fg:x="325053" fg:w="58515"/><text x="77.5953%" y="143.50">rust-1brc.exe`core::s..</text></g><g><title>rust-1brc.exe`core::slice::cmp::impl$5::equal (58,515 samples, 13.92%)</title><rect x="77.3453%" y="117" width="13.9235%" height="15" fill="rgb(205,185,37)" fg:x="325053" fg:w="58515"/><text x="77.5953%" y="127.50">rust-1brc.exe`core::s..</text></g><g><title>rust-1brc.exe`memcmp (2,357 samples, 0.56%)</title><rect x="90.7079%" y="101" width="0.5608%" height="15" fill="rgb(238,207,15)" fg:x="381211" fg:w="2357"/><text x="90.9579%" y="111.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::sse2::Group::load (1,133 samples, 0.27%)</title><rect x="91.2688%" y="213" width="0.2696%" height="15" fill="rgb(213,199,42)" fg:x="383568" fg:w="1133"/><text x="91.5188%" y="223.50"></text></g><g><title>rust-1brc.exe`core::core_arch::x86::sse2::_mm_loadu_si128 (1,133 samples, 0.27%)</title><rect x="91.2688%" y="197" width="0.2696%" height="15" fill="rgb(235,201,11)" fg:x="383568" fg:w="1133"/><text x="91.5188%" y="207.50"></text></g><g><title>rust-1brc.exe`core::intrinsics::copy_nonoverlapping (1,133 samples, 0.27%)</title><rect x="91.2688%" y="181" width="0.2696%" height="15" fill="rgb(207,46,11)" fg:x="383568" fg:w="1133"/><text x="91.5188%" y="191.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::sse2::Group::match_byte (8,014 samples, 1.91%)</title><rect x="91.5384%" y="213" width="1.9069%" height="15" fill="rgb(241,35,35)" fg:x="384701" fg:w="8014"/><text x="91.7884%" y="223.50">r..</text></g><g><title>rust-1brc.exe`core::core_arch::x86::sse2::_mm_movemask_epi8 (8,014 samples, 1.91%)</title><rect x="91.5384%" y="197" width="1.9069%" height="15" fill="rgb(243,32,47)" fg:x="384701" fg:w="8014"/><text x="91.7884%" y="207.50">r..</text></g><g><title>rust-1brc.exe`std::collections::hash::map::HashMap::entry (136,037 samples, 32.37%)</title><rect x="61.1875%" y="277" width="32.3696%" height="15" fill="rgb(247,202,23)" fg:x="257148" fg:w="136037"/><text x="61.4375%" y="287.50">rust-1brc.exe`std::collections::hash::map::HashMap::..</text></g><g><title>rust-1brc.exe`hashbrown::map::HashMap::rustc_entry (136,037 samples, 32.37%)</title><rect x="61.1875%" y="261" width="32.3696%" height="15" fill="rgb(219,102,11)" fg:x="257148" fg:w="136037"/><text x="61.4375%" y="271.50">rust-1brc.exe`hashbrown::map::HashMap::rustc_entry</text></g><g><title>rust-1brc.exe`hashbrown::raw::RawTable::find (114,908 samples, 27.34%)</title><rect x="66.2151%" y="245" width="27.3420%" height="15" fill="rgb(243,110,44)" fg:x="278277" fg:w="114908"/><text x="66.4651%" y="255.50">rust-1brc.exe`hashbrown::raw::RawTable::find</text></g><g><title>rust-1brc.exe`hashbrown::raw::RawTableInner::find_inner (111,034 samples, 26.42%)</title><rect x="67.1369%" y="229" width="26.4202%" height="15" fill="rgb(222,74,54)" fg:x="282151" fg:w="111034"/><text x="67.3869%" y="239.50">rust-1brc.exe`hashbrown::raw::RawTableInne..</text></g><g><title>rust-1brc.exe`hashbrown::raw::sse2::Group::match_empty (470 samples, 0.11%)</title><rect x="93.4453%" y="213" width="0.1118%" height="15" fill="rgb(216,99,12)" fg:x="392715" fg:w="470"/><text x="93.6953%" y="223.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::sse2::Group::match_byte (470 samples, 0.11%)</title><rect x="93.4453%" y="197" width="0.1118%" height="15" fill="rgb(226,22,26)" fg:x="392715" fg:w="470"/><text x="93.6953%" y="207.50"></text></g><g><title>rust-1brc.exe`core::core_arch::x86::sse2::_mm_movemask_epi8 (470 samples, 0.11%)</title><rect x="93.4453%" y="181" width="0.1118%" height="15" fill="rgb(217,163,10)" fg:x="392715" fg:w="470"/><text x="93.6953%" y="191.50"></text></g><g><title>rust-1brc.exe`std::collections::hash::map::OccupiedEntry::into_mut (799 samples, 0.19%)</title><rect x="93.5571%" y="277" width="0.1901%" height="15" fill="rgb(213,25,53)" fg:x="393185" fg:w="799"/><text x="93.8071%" y="287.50"></text></g><g><title>rust-1brc.exe`hashbrown::rustc_entry::RustcOccupiedEntry::into_mut (799 samples, 0.19%)</title><rect x="93.5571%" y="261" width="0.1901%" height="15" fill="rgb(252,105,26)" fg:x="393185" fg:w="799"/><text x="93.8071%" y="271.50"></text></g><g><title>rust-1brc.exe`core::ops::function::FnOnce::call_once&lt;std::thread::impl$0::spawn_unchecked_::closure_env$1&lt;rust_1brc::main::closure$0::closure_env$0,std::collections::hash::map::HashMap&lt;ref$&lt;str$&gt;,rust_1brc::StationData,core::hash::BuildHasherDefault&lt;rustc_hash::FxHasher&gt; &gt; &gt;,tuple$&lt;&gt; &gt; (367,554 samples, 87.46%)</title><rect x="6.2899%" y="373" width="87.4583%" height="15" fill="rgb(220,39,43)" fg:x="26434" fg:w="367554"/><text x="6.5399%" y="383.50">rust-1brc.exe`core::ops::function::FnOnce::call_once&lt;std::thread::impl$0::spawn_unchecked_::closure_env$1&lt;rust_1brc::main::closure$0::closure_env$..</text></g><g><title>rust-1brc.exe`std::thread::impl$0::spawn_unchecked_::closure$1 (367,554 samples, 87.46%)</title><rect x="6.2899%" y="357" width="87.4583%" height="15" fill="rgb(229,68,48)" fg:x="26434" fg:w="367554"/><text x="6.5399%" y="367.50">rust-1brc.exe`std::thread::impl$0::spawn_unchecked_::closure$1</text></g><g><title>rust-1brc.exe`std::panic::catch_unwind (367,554 samples, 87.46%)</title><rect x="6.2899%" y="341" width="87.4583%" height="15" fill="rgb(252,8,32)" fg:x="26434" fg:w="367554"/><text x="6.5399%" y="351.50">rust-1brc.exe`std::panic::catch_unwind</text></g><g><title>rust-1brc.exe`std::panicking::try (367,554 samples, 87.46%)</title><rect x="6.2899%" y="325" width="87.4583%" height="15" fill="rgb(223,20,43)" fg:x="26434" fg:w="367554"/><text x="6.5399%" y="335.50">rust-1brc.exe`std::panicking::try</text></g><g><title>rust-1brc.exe`std::sys_common::backtrace::__rust_begin_short_backtrace&lt;rust_1brc::main::closure$0::closure_env$0,std::collections::hash::map::HashMap&lt;ref$&lt;str$&gt;,rust_1brc::StationData,core::hash::BuildHasherDefault&lt;rustc_hash::FxHasher&gt; &gt; &gt; (367,554 samples, 87.46%)</title><rect x="6.2899%" y="309" width="87.4583%" height="15" fill="rgb(229,81,49)" fg:x="26434" fg:w="367554"/><text x="6.5399%" y="319.50">rust-1brc.exe`std::sys_common::backtrace::__rust_begin_short_backtrace&lt;rust_1brc::main::closure$0::closure_env$0,std::collections::hash::map::Hash..</text></g><g><title>rust-1brc.exe`rust_1brc::compute (367,554 samples, 87.46%)</title><rect x="6.2899%" y="293" width="87.4583%" height="15" fill="rgb(236,28,36)" fg:x="26434" fg:w="367554"/><text x="6.5399%" y="303.50">rust-1brc.exe`rust_1brc::compute</text></g><g><title>rust-1brc.exe`core::ptr::const_ptr::impl$0::offset (184 samples, 0.04%)</title><rect x="97.3026%" y="277" width="0.0438%" height="15" fill="rgb(249,185,26)" fg:x="408926" fg:w="184"/><text x="97.5526%" y="287.50"></text></g><g><title>rust-1brc.exe`rust_1brc::parse_2_digit_number (1,354 samples, 0.32%)</title><rect x="97.3517%" y="277" width="0.3222%" height="15" fill="rgb(249,174,33)" fg:x="409132" fg:w="1354"/><text x="97.6017%" y="287.50"></text></g><g><title>rust-1brc.exe`core::array::impl$7::try_from (82 samples, 0.02%)</title><rect x="97.8240%" y="117" width="0.0195%" height="15" fill="rgb(233,201,37)" fg:x="411117" fg:w="82"/><text x="98.0740%" y="127.50"></text></g><g><title>rust-1brc.exe`core::result::Result::map (82 samples, 0.02%)</title><rect x="97.8240%" y="101" width="0.0195%" height="15" fill="rgb(221,78,26)" fg:x="411117" fg:w="82"/><text x="98.0740%" y="111.50"></text></g><g><title>rust-1brc.exe`core::convert::impl$6::try_into (269 samples, 0.06%)</title><rect x="97.8240%" y="133" width="0.0640%" height="15" fill="rgb(250,127,30)" fg:x="411117" fg:w="269"/><text x="98.0740%" y="143.50"></text></g><g><title>rust-1brc.exe`core::num::impl$11::rotate_left (187 samples, 0.04%)</title><rect x="97.8435%" y="117" width="0.0445%" height="15" fill="rgb(230,49,44)" fg:x="411199" fg:w="187"/><text x="98.0935%" y="127.50"></text></g><g><title>rust-1brc.exe`core::slice::index::impl$0::index (144 samples, 0.03%)</title><rect x="97.8880%" y="133" width="0.0343%" height="15" fill="rgb(229,67,23)" fg:x="411386" fg:w="144"/><text x="98.1380%" y="143.50"></text></g><g><title>rust-1brc.exe`core::slice::index::impl$6::index (144 samples, 0.03%)</title><rect x="97.8880%" y="117" width="0.0343%" height="15" fill="rgb(249,83,47)" fg:x="411386" fg:w="144"/><text x="98.1380%" y="127.50"></text></g><g><title>rust-1brc.exe`core::slice::index::impl$6::get_unchecked (144 samples, 0.03%)</title><rect x="97.8880%" y="101" width="0.0343%" height="15" fill="rgb(215,43,3)" fg:x="411386" fg:w="144"/><text x="98.1380%" y="111.50"></text></g><g><title>rust-1brc.exe`core::slice::index::impl$4::get_unchecked (144 samples, 0.03%)</title><rect x="97.8880%" y="85" width="0.0343%" height="15" fill="rgb(238,154,13)" fg:x="411386" fg:w="144"/><text x="98.1380%" y="95.50"></text></g><g><title>rust-1brc.exe`rustc_hash::impl$2::write (1,268 samples, 0.30%)</title><rect x="97.6738%" y="149" width="0.3017%" height="15" fill="rgb(219,56,2)" fg:x="410486" fg:w="1268"/><text x="97.9238%" y="159.50"></text></g><g><title>rust-1brc.exe`rustc_hash::FxHasher::add_to_hash (224 samples, 0.05%)</title><rect x="97.9222%" y="133" width="0.0533%" height="15" fill="rgb(233,0,4)" fg:x="411530" fg:w="224"/><text x="98.1722%" y="143.50"></text></g><g><title>rust-1brc.exe`core::num::impl$11::rotate_left (224 samples, 0.05%)</title><rect x="97.9222%" y="117" width="0.0533%" height="15" fill="rgb(235,30,7)" fg:x="411530" fg:w="224"/><text x="98.1722%" y="127.50"></text></g><g><title>rust-1brc.exe`hashbrown::map::make_hash (1,574 samples, 0.37%)</title><rect x="97.6738%" y="245" width="0.3745%" height="15" fill="rgb(250,79,13)" fg:x="410486" fg:w="1574"/><text x="97.9238%" y="255.50"></text></g><g><title>rust-1brc.exe`core::hash::BuildHasher::hash_one (1,574 samples, 0.37%)</title><rect x="97.6738%" y="229" width="0.3745%" height="15" fill="rgb(211,146,34)" fg:x="410486" fg:w="1574"/><text x="97.9238%" y="239.50"></text></g><g><title>rust-1brc.exe`core::hash::impls::impl$5::hash (1,574 samples, 0.37%)</title><rect x="97.6738%" y="213" width="0.3745%" height="15" fill="rgb(228,22,38)" fg:x="410486" fg:w="1574"/><text x="97.9238%" y="223.50"></text></g><g><title>rust-1brc.exe`core::hash::impls::impl$5::hash (1,574 samples, 0.37%)</title><rect x="97.6738%" y="197" width="0.3745%" height="15" fill="rgb(235,168,5)" fg:x="410486" fg:w="1574"/><text x="97.9238%" y="207.50"></text></g><g><title>rust-1brc.exe`core::hash::impls::impl$2::hash (1,574 samples, 0.37%)</title><rect x="97.6738%" y="181" width="0.3745%" height="15" fill="rgb(221,155,16)" fg:x="410486" fg:w="1574"/><text x="97.9238%" y="191.50"></text></g><g><title>rust-1brc.exe`core::hash::Hasher::write_str (1,574 samples, 0.37%)</title><rect x="97.6738%" y="165" width="0.3745%" height="15" fill="rgb(215,215,53)" fg:x="410486" fg:w="1574"/><text x="97.9238%" y="175.50"></text></g><g><title>rust-1brc.exe`rustc_hash::impl$2::write_u8 (306 samples, 0.07%)</title><rect x="97.9755%" y="149" width="0.0728%" height="15" fill="rgb(223,4,10)" fg:x="411754" fg:w="306"/><text x="98.2255%" y="159.50"></text></g><g><title>rust-1brc.exe`rustc_hash::FxHasher::add_to_hash (306 samples, 0.07%)</title><rect x="97.9755%" y="133" width="0.0728%" height="15" fill="rgb(234,103,6)" fg:x="411754" fg:w="306"/><text x="98.2255%" y="143.50"></text></g><g><title>rust-1brc.exe`core::num::impl$11::rotate_left (306 samples, 0.07%)</title><rect x="97.9755%" y="117" width="0.0728%" height="15" fill="rgb(227,97,0)" fg:x="411754" fg:w="306"/><text x="98.2255%" y="127.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::bitmask::impl$3::next (82 samples, 0.02%)</title><rect x="98.1802%" y="213" width="0.0195%" height="15" fill="rgb(234,150,53)" fg:x="412614" fg:w="82"/><text x="98.4302%" y="223.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::bitmask::BitMask::lowest_set_bit (82 samples, 0.02%)</title><rect x="98.1802%" y="197" width="0.0195%" height="15" fill="rgb(228,201,54)" fg:x="412614" fg:w="82"/><text x="98.4302%" y="207.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::h2 (936 samples, 0.22%)</title><rect x="98.1997%" y="213" width="0.2227%" height="15" fill="rgb(222,22,37)" fg:x="412696" fg:w="936"/><text x="98.4497%" y="223.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::RawTable::bucket (397 samples, 0.09%)</title><rect x="98.7472%" y="197" width="0.0945%" height="15" fill="rgb(237,53,32)" fg:x="414997" fg:w="397"/><text x="98.9972%" y="207.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::Bucket::from_base_index (397 samples, 0.09%)</title><rect x="98.7472%" y="181" width="0.0945%" height="15" fill="rgb(233,25,53)" fg:x="414997" fg:w="397"/><text x="98.9972%" y="191.50"></text></g><g><title>rust-1brc.exe`core::ptr::mut_ptr::impl$0::sub (397 samples, 0.09%)</title><rect x="98.7472%" y="165" width="0.0945%" height="15" fill="rgb(210,40,34)" fg:x="414997" fg:w="397"/><text x="98.9972%" y="175.50"></text></g><g><title>rust-1brc.exe`core::ptr::mut_ptr::impl$0::offset (281 samples, 0.07%)</title><rect x="98.7748%" y="149" width="0.0669%" height="15" fill="rgb(241,220,44)" fg:x="415113" fg:w="281"/><text x="99.0248%" y="159.50"></text></g><g><title>`0x7FFD6B171219 (83 samples, 0.02%)</title><rect x="98.9359%" y="101" width="0.0197%" height="15" fill="rgb(235,28,35)" fg:x="415790" fg:w="83"/><text x="99.1859%" y="111.50"></text></g><g><title>`0x7FFD6B171220 (117 samples, 0.03%)</title><rect x="98.9568%" y="101" width="0.0278%" height="15" fill="rgb(210,56,17)" fg:x="415878" fg:w="117"/><text x="99.2068%" y="111.50"></text></g><g><title>`0x7FFD6B171222 (594 samples, 0.14%)</title><rect x="98.9847%" y="101" width="0.1413%" height="15" fill="rgb(224,130,29)" fg:x="415995" fg:w="594"/><text x="99.2347%" y="111.50"></text></g><g><title>`0x7FFD6B171227 (142 samples, 0.03%)</title><rect x="99.1260%" y="101" width="0.0338%" height="15" fill="rgb(235,212,8)" fg:x="416589" fg:w="142"/><text x="99.3760%" y="111.50"></text></g><g><title>`0x7FFD6B17122D (59 samples, 0.01%)</title><rect x="99.1612%" y="101" width="0.0140%" height="15" fill="rgb(223,33,50)" fg:x="416737" fg:w="59"/><text x="99.4112%" y="111.50"></text></g><g><title>`0x7FFD6B171232 (231 samples, 0.05%)</title><rect x="99.1753%" y="101" width="0.0550%" height="15" fill="rgb(219,149,13)" fg:x="416796" fg:w="231"/><text x="99.4253%" y="111.50"></text></g><g><title>`0x7FFD6B171235 (89 samples, 0.02%)</title><rect x="99.2302%" y="101" width="0.0212%" height="15" fill="rgb(250,156,29)" fg:x="417027" fg:w="89"/><text x="99.4802%" y="111.50"></text></g><g><title>`0x7FFD6B171239 (264 samples, 0.06%)</title><rect x="99.2514%" y="101" width="0.0628%" height="15" fill="rgb(216,193,19)" fg:x="417116" fg:w="264"/><text x="99.5014%" y="111.50"></text></g><g><title>`0x7FFD6B17123B (117 samples, 0.03%)</title><rect x="99.3142%" y="101" width="0.0278%" height="15" fill="rgb(216,135,14)" fg:x="417380" fg:w="117"/><text x="99.5642%" y="111.50"></text></g><g><title>`0x7FFD6B171240 (162 samples, 0.04%)</title><rect x="99.3421%" y="101" width="0.0385%" height="15" fill="rgb(241,47,5)" fg:x="417497" fg:w="162"/><text x="99.5921%" y="111.50"></text></g><g><title>`0x7FFD6B171242 (914 samples, 0.22%)</title><rect x="99.3806%" y="101" width="0.2175%" height="15" fill="rgb(233,42,35)" fg:x="417659" fg:w="914"/><text x="99.6306%" y="111.50"></text></g><g><title>`0x7FFD6B171247 (418 samples, 0.10%)</title><rect x="99.5981%" y="101" width="0.0995%" height="15" fill="rgb(231,13,6)" fg:x="418573" fg:w="418"/><text x="99.8481%" y="111.50"></text></g><g><title>`0x7FFD6B17124A (69 samples, 0.02%)</title><rect x="99.6976%" y="101" width="0.0164%" height="15" fill="rgb(207,181,40)" fg:x="418991" fg:w="69"/><text x="99.9476%" y="111.50"></text></g><g><title>`0x7FFD6B17129E (65 samples, 0.02%)</title><rect x="99.7440%" y="101" width="0.0155%" height="15" fill="rgb(254,173,49)" fg:x="419186" fg:w="65"/><text x="99.9940%" y="111.50"></text></g><g><title>`0x7FFD6B1712A9 (59 samples, 0.01%)</title><rect x="99.7749%" y="101" width="0.0140%" height="15" fill="rgb(221,1,38)" fg:x="419316" fg:w="59"/><text x="100.0249%" y="111.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::impl$7::find::closure$0 (5,931 samples, 1.41%)</title><rect x="98.4224%" y="213" width="1.4113%" height="15" fill="rgb(206,124,46)" fg:x="413632" fg:w="5931"/><text x="98.6724%" y="223.50"></text></g><g><title>rust-1brc.exe`hashbrown::rustc_entry::impl$0::rustc_entry::closure$0 (4,169 samples, 0.99%)</title><rect x="98.8417%" y="197" width="0.9920%" height="15" fill="rgb(249,21,11)" fg:x="415394" fg:w="4169"/><text x="99.0917%" y="207.50"></text></g><g><title>rust-1brc.exe`core::cmp::impls::impl$9::eq (4,169 samples, 0.99%)</title><rect x="98.8417%" y="181" width="0.9920%" height="15" fill="rgb(222,201,40)" fg:x="415394" fg:w="4169"/><text x="99.0917%" y="191.50"></text></g><g><title>rust-1brc.exe`core::str::traits::impl$1::eq (4,169 samples, 0.99%)</title><rect x="98.8417%" y="165" width="0.9920%" height="15" fill="rgb(235,61,29)" fg:x="415394" fg:w="4169"/><text x="99.0917%" y="175.50"></text></g><g><title>rust-1brc.exe`core::cmp::impls::impl$9::eq (4,169 samples, 0.99%)</title><rect x="98.8417%" y="149" width="0.9920%" height="15" fill="rgb(219,207,3)" fg:x="415394" fg:w="4169"/><text x="99.0917%" y="159.50"></text></g><g><title>rust-1brc.exe`core::slice::cmp::impl$0::eq (4,169 samples, 0.99%)</title><rect x="98.8417%" y="133" width="0.9920%" height="15" fill="rgb(222,56,46)" fg:x="415394" fg:w="4169"/><text x="99.0917%" y="143.50"></text></g><g><title>rust-1brc.exe`core::slice::cmp::impl$5::equal (4,169 samples, 0.99%)</title><rect x="98.8417%" y="117" width="0.9920%" height="15" fill="rgb(239,76,54)" fg:x="415394" fg:w="4169"/><text x="99.0917%" y="127.50"></text></g><g><title>rust-1brc.exe`memcmp (172 samples, 0.04%)</title><rect x="99.7927%" y="101" width="0.0409%" height="15" fill="rgb(231,124,27)" fg:x="419391" fg:w="172"/><text x="100.0427%" y="111.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::sse2::Group::load (60 samples, 0.01%)</title><rect x="99.8337%" y="213" width="0.0143%" height="15" fill="rgb(249,195,6)" fg:x="419563" fg:w="60"/><text x="100.0837%" y="223.50"></text></g><g><title>rust-1brc.exe`core::core_arch::x86::sse2::_mm_loadu_si128 (60 samples, 0.01%)</title><rect x="99.8337%" y="197" width="0.0143%" height="15" fill="rgb(237,174,47)" fg:x="419563" fg:w="60"/><text x="100.0837%" y="207.50"></text></g><g><title>rust-1brc.exe`core::intrinsics::copy_nonoverlapping (60 samples, 0.01%)</title><rect x="99.8337%" y="181" width="0.0143%" height="15" fill="rgb(206,201,31)" fg:x="419563" fg:w="60"/><text x="100.0837%" y="191.50"></text></g><g><title>rust-1brc.exe`hashbrown::raw::sse2::Group::match_byte (534 samples, 0.13%)</title><rect x="99.8480%" y="213" width="0.1271%" height="15" fill="rgb(231,57,52)" fg:x="419623" fg:w="534"/><text x="100.0980%" y="223.50"></text></g><g><title>rust-1brc.exe`core::core_arch::x86::sse2::_mm_movemask_epi8 (534 samples, 0.13%)</title><rect x="99.8480%" y="197" width="0.1271%" height="15" fill="rgb(248,177,22)" fg:x="419623" fg:w="534"/><text x="100.0980%" y="207.50"></text></g><g><title>rust-1brc.exe`std::collections::hash::map::HashMap::entry (9,704 samples, 2.31%)</title><rect x="97.6738%" y="277" width="2.3090%" height="15" fill="rgb(215,211,37)" fg:x="410486" fg:w="9704"/><text x="97.9238%" y="287.50">r..</text></g><g><title>rust-1brc.exe`hashbrown::map::HashMap::rustc_entry (9,704 samples, 2.31%)</title><rect x="97.6738%" y="261" width="2.3090%" height="15" fill="rgb(241,128,51)" fg:x="410486" fg:w="9704"/><text x="97.9238%" y="271.50">r..</text></g><g><title>rust-1brc.exe`hashbrown::raw::RawTable::find (8,130 samples, 1.93%)</title><rect x="98.0484%" y="245" width="1.9345%" height="15" fill="rgb(227,165,31)" fg:x="412060" fg:w="8130"/><text x="98.2984%" y="255.50">r..</text></g><g><title>rust-1brc.exe`hashbrown::raw::RawTableInner::find_inner (7,875 samples, 1.87%)</title><rect x="98.1090%" y="229" width="1.8738%" height="15" fill="rgb(228,167,24)" fg:x="412315" fg:w="7875"/><text x="98.3590%" y="239.50">r..</text></g><g><title>`0x7FFD8C86AA58 (420,242 samples, 100.00%)</title><rect x="0.0005%" y="469" width="99.9952%" height="15" fill="rgb(228,143,12)" fg:x="2" fg:w="420242"/><text x="0.2505%" y="479.50">`0x7FFD8C86AA58</text></g><g><title>`0x7FFD8AD2257D (420,242 samples, 100.00%)</title><rect x="0.0005%" y="453" width="99.9952%" height="15" fill="rgb(249,149,8)" fg:x="2" fg:w="420242"/><text x="0.2505%" y="463.50">`0x7FFD8AD2257D</text></g><g><title>rust-1brc.exe`std::sys::windows::thread::impl$0::new::thread_start (393,810 samples, 93.71%)</title><rect x="6.2899%" y="437" width="93.7058%" height="15" fill="rgb(243,35,44)" fg:x="26434" fg:w="393810"/><text x="6.5399%" y="447.50">rust-1brc.exe`std::sys::windows::thread::impl$0::new::thread_start</text></g><g><title>rust-1brc.exe`alloc::boxed::impl$47::call_once (393,810 samples, 93.71%)</title><rect x="6.2899%" y="421" width="93.7058%" height="15" fill="rgb(246,89,9)" fg:x="26434" fg:w="393810"/><text x="6.5399%" y="431.50">rust-1brc.exe`alloc::boxed::impl$47::call_once</text></g><g><title>rust-1brc.exe`alloc::boxed::impl$47::call_once (393,810 samples, 93.71%)</title><rect x="6.2899%" y="405" width="93.7058%" height="15" fill="rgb(233,213,13)" fg:x="26434" fg:w="393810"/><text x="6.5399%" y="415.50">rust-1brc.exe`alloc::boxed::impl$47::call_once</text></g><g><title>rust-1brc.exe`alloc::boxed::impl$8::drop (393,810 samples, 93.71%)</title><rect x="6.2899%" y="389" width="93.7058%" height="15" fill="rgb(233,141,41)" fg:x="26434" fg:w="393810"/><text x="6.5399%" y="399.50">rust-1brc.exe`alloc::boxed::impl$8::drop</text></g><g><title>rust-1brc.exe`core::ops::function::FnOnce::call_once&lt;std::thread::impl$0::spawn_unchecked_::closure_env$1&lt;rust_1brc::main::closure$0::closure_env$1,std::collections::hash::map::HashMap&lt;ref$&lt;str$&gt;,rust_1brc::StationData,core::hash::BuildHasherDefault&lt;rustc_hash::FxHasher&gt; &gt; &gt;,tuple$&lt;&gt; &gt; (26,256 samples, 6.25%)</title><rect x="93.7482%" y="373" width="6.2475%" height="15" fill="rgb(239,167,4)" fg:x="393988" fg:w="26256"/><text x="93.9982%" y="383.50">rust-1br..</text></g><g><title>rust-1brc.exe`std::thread::impl$0::spawn_unchecked_::closure$1 (26,256 samples, 6.25%)</title><rect x="93.7482%" y="357" width="6.2475%" height="15" fill="rgb(209,217,16)" fg:x="393988" fg:w="26256"/><text x="93.9982%" y="367.50">rust-1br..</text></g><g><title>rust-1brc.exe`std::panic::catch_unwind (26,256 samples, 6.25%)</title><rect x="93.7482%" y="341" width="6.2475%" height="15" fill="rgb(219,88,35)" fg:x="393988" fg:w="26256"/><text x="93.9982%" y="351.50">rust-1br..</text></g><g><title>rust-1brc.exe`std::panicking::try (26,256 samples, 6.25%)</title><rect x="93.7482%" y="325" width="6.2475%" height="15" fill="rgb(220,193,23)" fg:x="393988" fg:w="26256"/><text x="93.9982%" y="335.50">rust-1br..</text></g><g><title>rust-1brc.exe`std::sys_common::backtrace::__rust_begin_short_backtrace&lt;rust_1brc::main::closure$0::closure_env$1,std::collections::hash::map::HashMap&lt;ref$&lt;str$&gt;,rust_1brc::StationData,core::hash::BuildHasherDefault&lt;rustc_hash::FxHasher&gt; &gt; &gt; (26,256 samples, 6.25%)</title><rect x="93.7482%" y="309" width="6.2475%" height="15" fill="rgb(230,90,52)" fg:x="393988" fg:w="26256"/><text x="93.9982%" y="319.50">rust-1br..</text></g><g><title>rust-1brc.exe`rust_1brc::compute (26,256 samples, 6.25%)</title><rect x="93.7482%" y="293" width="6.2475%" height="15" fill="rgb(252,106,19)" fg:x="393988" fg:w="26256"/><text x="93.9982%" y="303.50">rust-1br..</text></g><g><title>rust-1brc.exe`std::collections::hash::map::OccupiedEntry::into_mut (54 samples, 0.01%)</title><rect x="99.9829%" y="277" width="0.0128%" height="15" fill="rgb(206,74,20)" fg:x="420190" fg:w="54"/><text x="100.2329%" y="287.50"></text></g><g><title>rust-1brc.exe`hashbrown::rustc_entry::RustcOccupiedEntry::into_mut (54 samples, 0.01%)</title><rect x="99.9829%" y="261" width="0.0128%" height="15" fill="rgb(230,138,44)" fg:x="420190" fg:w="54"/><text x="100.2329%" y="271.50"></text></g><g><title>all (420,262 samples, 100%)</title><rect x="0.0000%" y="485" width="100.0000%" height="15" fill="rgb(235,182,43)" fg:x="0" fg:w="420262"/><text x="0.2500%" y="495.50"></text></g></svg></svg>

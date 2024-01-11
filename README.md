@@ -37,3 +37,8 @@ removed some bounds check
 real    0m33.155s
 user    0m0.000s
 sys     0m0.000s
+added basic multi-threading
+==========
+real    0m4.718s
+user    0m0.000s
+sys     0m0.000s
