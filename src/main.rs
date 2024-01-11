@@ -32,13 +32,15 @@ unsafe fn compute(text: &[u8]) {
     while current_index < text.len() {
         match &text[current_index] {
             b'\n' => {
-                let name =
-                    std::str::from_utf8_unchecked(&text[start_of_line_index..separator_index]);
-
+                let name = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                    text.as_ptr().offset(start_of_line_index as _),
+                    separator_index - start_of_line_index,
+                ));
                 let is_neg = *text.get_unchecked(separator_index + 1) == b'-';
                 let num_len = current_index - separator_index - 3 - is_neg as usize;
                 let mut report_value = parse_2_digit_number(
-                    &text[separator_index + 1 - (2 - num_len) + is_neg as usize] as *const u8,
+                    text.as_ptr()
+                        .offset((separator_index + 1 - (2 - num_len) + is_neg as usize) as _),
                     num_len,
                 ) as i64
                     * 10;
@@ -70,9 +72,12 @@ unsafe fn compute(text: &[u8]) {
         }
         current_index += 1;
     }
-    let mut reports_array = reports_map.into_iter().collect::<Vec<_>>();
-    reports_array.sort_by(|a, b| a.0.cmp(b.0));
+    let reports_array = to_vec(reports_map);
 
+    print_result(reports_array);
+}
+
+fn print_result(reports_array: Vec<(&str, StationData)>) {
     let mut output_str = String::new();
     output_str.push('{');
 
@@ -85,11 +90,15 @@ unsafe fn compute(text: &[u8]) {
             add_comma = true;
         }
 
-        let avg = (report.report_sum as f64 / 10.0 / report.report_count as f64 * 10.0).round() / 10.0;
+        let avg =
+            (report.report_sum as f64 / 10.0 / report.report_count as f64 * 10.0).round() / 10.0;
         output_str.push_str(
             format!(
                 "{}={:.1}/{:.1}/{:.1}",
-                name, report.min_report as f64 / 10.0, avg, report.max_report as f64 / 10.0 
+                name,
+                report.min_report as f64 / 10.0,
+                avg,
+                report.max_report as f64 / 10.0
             )
             .as_str(),
         );
@@ -100,7 +109,19 @@ unsafe fn compute(text: &[u8]) {
     println!("{}", output_str);
 }
 
-#[inline(always)]
+fn to_vec(
+    reports_map: std::collections::HashMap<
+        &str,
+        StationData,
+        std::hash::BuildHasherDefault<rustc_hash::FxHasher>,
+    >,
+) -> Vec<(&str, StationData)> {
+    let mut reports_array = reports_map.into_iter().collect::<Vec<_>>();
+    reports_array.sort_by(|a, b| a.0.cmp(b.0));
+    reports_array
+}
+
+// #[inline(always)]
 unsafe fn parse_2_digit_number(ptr: *const u8, len: usize) -> u16 {
     const ZERO_MASK: u16 = 0x3030;
 

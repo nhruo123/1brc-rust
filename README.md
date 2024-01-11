@@ -32,3 +32,8 @@ better branchless parser
 real    0m34.433s
 user    0m0.000s
 sys     0m0.000s
+removed some bounds check
+======
+real    0m33.155s
+user    0m0.000s
+sys     0m0.000s
