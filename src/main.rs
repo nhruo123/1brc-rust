@@ -12,27 +12,33 @@ struct StationData {
 const MEASUREMENTS_FILE_PATH: &str = "../1brc/measurements.txt";
 
 fn main() {
-    let mut reports_map = FxHashMap::<&str, StationData>::default();
     let file = File::open(MEASUREMENTS_FILE_PATH).unwrap();
-    let mmap = unsafe {
-        memmap2::MmapOptions::new()
+    unsafe {
+        let mmap = memmap2::MmapOptions::new()
             .map_copy_read_only(&file)
-            .unwrap()
-    };
+            .unwrap();
+
+        compute(&mmap);
+    }
+}
+
+unsafe fn compute(text: &[u8]) {
+    let mut reports_map = FxHashMap::<&str, StationData>::default();
 
     let mut start_of_line_index = 0;
     let mut separator_index = 0;
     let mut current_index = 0;
 
-    while current_index < mmap.len() {
-        match &mmap[current_index] {
+    while current_index < text.len() {
+        match &text[current_index] {
             b'\n' => {
-                let name = unsafe {
-                    std::str::from_utf8_unchecked(&mmap[start_of_line_index..separator_index])
-                };
-                let report_value =
-                    parse_fixed_point_number(&mmap[separator_index + 1..current_index]) as f64
-                        / 10.0;
+                let name =
+                    std::str::from_utf8_unchecked(&text[start_of_line_index..separator_index]);
+                let mut reported_value =
+                    parse_fixed_point_number(text.as_ptr().wrapping_add(current_index - 1));
+                let is_neg = *text.get_unchecked(separator_index + 1) == b'-';
+                reported_value *= !is_neg as i64 * 1 + is_neg as i64 * -1;
+                let report_value = reported_value as f64 / 10.0;
 
                 let entry = match reports_map.entry(name) {
                     std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
@@ -90,20 +96,22 @@ fn main() {
 }
 
 #[inline(always)]
-pub fn parse_fixed_point_number(buffer: &[u8]) -> i64 {
-    const ASCII_OFFSET: u8 = b'0';
-    let is_negative = buffer[0] == b'-';
+unsafe fn parse_fixed_point_number(end_of_num_char: *const u8) -> i64 {
     let mut number = 0;
-    let mut index = is_negative as usize;
-    while index < buffer.len() - 2 {
-        number *= 10;
-        number += (buffer[index] - ASCII_OFFSET) as i64;
-        index += 1;
+    let mut position = 1;
+
+    for index in 0..=4 {
+        let char = *(end_of_num_char.wrapping_sub(index));
+        let is_good = char >= b'0' && char <= b'9';
+        number += convert_from_ascii(char) as i64 * is_good as i64 * position;
+        position *= (1 * !is_good as i64) + (10 * is_good as i64);
     }
 
-    number *= 10;
-    number += (buffer[buffer.len() - 1] - ASCII_OFFSET) as i64;
+    number
+}
 
-    // this is branchless even with the if the compiler is smart 
-    number * if is_negative { -1 } else { 1 }
+#[inline(always)]
+fn convert_from_ascii(char: u8) -> i64 {
+    const ASCII_OFFSET: u8 = b'0';
+    (char.wrapping_sub(ASCII_OFFSET)) as _
 }

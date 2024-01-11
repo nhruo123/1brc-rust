@@ -22,3 +22,8 @@ Third try (rolling my own basic parser)
 real    0m36.119s
 user    0m0.000s
 sys     0m0.000s
+branchless parser not sure if faster but w/e
+=========
+real    0m35.752s
+user    0m0.000s
+sys     0m0.000s
