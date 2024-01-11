@@ -27,12 +27,14 @@ fn main() {
     while current_index < mmap.len() {
         match &mmap[current_index] {
             b'\n' => {
-                let name =
-                    std::str::from_utf8(&mmap[start_of_line_index..separator_index]).unwrap();
-                let report_value = std::str::from_utf8(&mmap[separator_index + 1..current_index])
-                    .unwrap()
-                    .parse::<f64>()
-                    .unwrap();
+                let name = unsafe {
+                    std::str::from_utf8_unchecked(&mmap[start_of_line_index..separator_index])
+                };
+                let report_value = unsafe {
+                    std::str::from_utf8_unchecked(&mmap[separator_index + 1..current_index])
+                        .parse::<f64>()
+                        .unwrap()
+                };
 
                 let entry = match reports_map.entry(name) {
                     std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
@@ -59,7 +61,7 @@ fn main() {
         current_index += 1;
     }
     let mut reports_array = reports_map.into_iter().collect::<Vec<_>>();
-    reports_array.sort_by(|a,b| a.0.cmp(b.0));
+    reports_array.sort_by(|a, b| a.0.cmp(b.0));
 
     let mut output_str = String::new();
     output_str.push('{');
@@ -81,7 +83,6 @@ fn main() {
             )
             .as_str(),
         );
-
     }
 
     output_str.push('}');
