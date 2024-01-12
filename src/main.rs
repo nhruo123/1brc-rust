@@ -1,5 +1,6 @@
 use std::{
     fs::File,
+    process::exit,
     thread::{self, available_parallelism},
 };
 
@@ -13,10 +14,13 @@ struct StationData {
 }
 
 const MEASUREMENTS_FILE_PATH: &str = "../1brc/measurements.txt";
+const MAX_GROUP_NAME_LEN: usize = 100;
+const MAX_GROUPS: usize = 512;
 
 fn main() {
     let file = File::open(MEASUREMENTS_FILE_PATH).unwrap();
     let task_count: usize = available_parallelism().unwrap().into();
+
     unsafe {
         let mmap = memmap2::MmapOptions::new()
             .map_copy_read_only(&file)
@@ -26,11 +30,11 @@ fn main() {
         let segment_size = file_size / task_count;
 
         let result_map = thread::scope(|s| {
-            let mut tasks = Vec::new();
             let buffer = &mmap;
-            for index in 1..task_count - 1 {
-                tasks.push(s.spawn(move || compute(buffer, index * segment_size, segment_size)));
-            }
+            let mut tasks: Vec<_> = (1..task_count - 1)
+                .map(|index| s.spawn(move || compute(buffer, index * segment_size, segment_size)))
+                .collect();
+
             tasks.push(s.spawn(move || {
                 compute(
                     buffer,
@@ -39,10 +43,10 @@ fn main() {
                 )
             }));
 
-            let mut result_map = compute(buffer, 0, segment_size);
+            let result_map = compute(buffer, 0, segment_size);
 
-            for result in tasks {
-                let result = result.join().unwrap();
+            tasks.into_iter().fold(result_map, |mut result_map, next_result| {
+                let result = next_result.join().unwrap();
                 for (key, value) in result {
                     let entry = match result_map.entry(key) {
                         std::collections::hash_map::Entry::Occupied(o) => o.into_mut(),
@@ -59,43 +63,45 @@ fn main() {
                     entry.report_sum += value.report_sum;
                     entry.report_count += value.report_count;
                 }
-            }
 
-            result_map
+                result_map
+            })
         });
 
-        let reports_array = to_vec(result_map);
+        let mut reports_array: Vec<_>= result_map.into_iter().collect();
+        reports_array.sort_unstable_by_key(|v| v.0);
         print_result(reports_array);
+
+        exit(0);
     }
 }
 
-unsafe fn compute(
-    text: &[u8],
-    start_offset: usize,
-    len: usize,
-) -> FxHashMap<&str, StationData> {
+unsafe fn compute(text: &[u8], start_offset: usize, len: usize) -> FxHashMap<&str, StationData> {
     let mut reports_map = FxHashMap::<&str, StationData>::default();
+    reports_map.reserve(MAX_GROUPS * 4);
 
     let mut current_index = start_offset;
 
     if current_index > 0 {
         while *text.get_unchecked(current_index) != b'\n' {
-           current_index += 1; 
+            current_index += 1;
         }
-        current_index +=1;
+        current_index += 1;
     }
 
     let mut start_of_line_index = current_index;
     let mut separator_index = current_index;
 
-
-    while current_index < start_offset + len || (start_offset + len < text.len() && *text.get_unchecked(current_index - 1) != b'\n'){
+    while current_index < start_offset + len
+        || (start_offset + len < text.len() && *text.get_unchecked(current_index - 1) != b'\n')
+    {
         match text.get_unchecked(current_index) {
             b'\n' => {
                 let name = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
                     text.as_ptr().offset(start_of_line_index as _),
                     separator_index - start_of_line_index,
                 ));
+
                 let is_neg = *text.get_unchecked(separator_index + 1) == b'-';
                 let num_len = current_index - separator_index - 3 - is_neg as usize;
                 let mut report_value = parse_2_digit_number(
@@ -133,12 +139,11 @@ unsafe fn compute(
         current_index += 1;
     }
 
-
     reports_map
 }
 
 fn print_result(reports_array: Vec<(&str, StationData)>) {
-    let mut output_str = String::new();
+    let mut output_str = String::with_capacity((MAX_GROUP_NAME_LEN + (3 * 4)) * MAX_GROUPS + 2);
     output_str.push('{');
 
     let mut add_comma = false;
@@ -167,12 +172,6 @@ fn print_result(reports_array: Vec<(&str, StationData)>) {
     output_str.push('}');
 
     println!("{}", output_str);
-}
-
-fn to_vec(reports_map: FxHashMap<&str, StationData>) -> Vec<(&str, StationData)> {
-    let mut reports_array = reports_map.into_iter().collect::<Vec<_>>();
-    reports_array.sort_by(|a, b| a.0.cmp(b.0));
-    reports_array
 }
 
 #[inline(always)]
