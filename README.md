@@ -3,7 +3,13 @@
 This is my ~~nice and safe~~ rust implementation of the java [1brc](https://github.com/gunnarmorling/1brc)
 
 
-After all of my changes I think that the biggest way to speed this up is using a custom made hashmap, a linear probe with a very simple hash like FNV, and while iterating over the string compute the hash at the parsing loop instead of the hashmap `entry` function.
+After all of my changes I think that the biggest way to speed this up is using a custom made hashmap, a linear probe with a very simple hash like FNV, pluse computing the hash as we iterate over the text instead of calling the hashmap `entry` function.
+
+##### runner specs:
+- 3.6 GHz with 16 cores
+- 16 GB of ram
+- slow AF hard drive ( but the test was done with a hot page without it we need like 5 min to read the file of the disk )
+
 
 
 ### Base line result
